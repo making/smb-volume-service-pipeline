@@ -16,13 +16,17 @@ resources:
   source:
     uri: https://github.com/pivotal-cf/pcf-pipelines.git
     tag_filter: v0.23.5
+- name: template
+  type: git
+  source:
+    uri: https://github.com/making/smb-volume-service-pipeline.git
 - name: terraform-state
   type: azure-blobstore
   source:
     storage_account_name: ((terraform_azure_storage_account_name))
     storage_account_key: ((terraform_azure_storage_access_key))
     container: ((azure_storage_container_name))
-    versioned_file: smb-volume-service.tfstate
+    versioned_file: terraform.tfstate
 - name: pivnet-product
   type: pivnet
   source:
@@ -34,94 +38,61 @@ jobs:
   build_logs_to_retain: 5
   serial: true
   plan:
+  - aggregate:
+    - get: pcf-pipelines
   - task: create-terraform-state
     params:
       AZURE_STORAGE_ACCOUNT: ((terraform_azure_storage_account_name))
       AZURE_STORAGE_KEY: ((terraform_azure_storage_access_key))
       CONTAINER: ((azure_storage_container_name))
+    file: pcf-pipelines/install-pcf/azure/tasks/create-initial-terraform-state/task.yml
+
+- name: pave-azure
+  build_logs_to_retain: 5
+  serial_groups: [terraform]
+  ensure:
+    put: terraform-state
+    params:
+      file: tfstate-output/terraform.tfstate
+  plan:
+  - aggregate:
+    - get: template
+    - get: terraform-state
+  - task: terraform-apply
+    params:
+      TFVARS: ((tfvars))
     config:
       platform: linux
       image_resource:
         type: docker-image
         source:
-          repository: pcfnorm/rootfs
-          tag: 1.0.14
+          repository: hashicorp/terraform
+          tag: light
+      inputs:
+      - name: template
+      - name: terraform-state
+      outputs:
+      - name: tfstate-output
       run:
-        path: bash
+        path: sh
         args: 
         - -c
         - |
-          # https://github.com/pivotal-cf/pcf-pipelines/blob/v0.23.4/install-pcf/azure/tasks/create-initial-terraform-state/task.sh
-          blobs=$(az storage blob list -c ${CONTAINER})
-          files=$(echo "$blobs" | jq -r .[].name)
+          set -e
 
-          set +e
-          echo ${files} | grep smb-volume-service.tfstate
-          if [ "$?" -gt "0" ]; then
-            echo "{\"version\": 3}" > smb-volume-service.tfstate
-            az storage blob upload -c ${CONTAINER} -n smb-volume-service.tfstate -f smb-volume-service.tfstate
-            set +x
-            if [ "$?" -gt "0" ]; then
-              echo "Failed to upload empty tfstate file"
-              exit 1
-            fi
-            set -x
-            az storage blob snapshot -c ${CONTAINER} -n smb-volume-service.tfstate
-            set +x
-            if [ "$?" -gt "0" ]; then
-              echo "Failed to create snapshot of tfstate file"
-              exit 1
-            fi
-          else
-            echo "smb-volume-service.tfstate file found, skipping"
-            exit 0
-          fi
-
-# - name: pave-azure
-#   build_logs_to_retain: 5
-#   serial_groups: [terraform]
-#   ensure:
-#     put: terraform-state
-#     params:
-#       file: tfstate-output/smb-volume-service.tfstate
-#   plan:
-#   - aggregate:
-#     - get: template
-#     - get: terraform-state
-#   - task: terraform-apply
-#     params:
-#       TFVARS: ((tfvars))
-#     config:
-#       platform: linux
-#       image_resource:
-#         type: docker-image
-#         source:
-#           repository: hashicorp/terraform
-#           tag: light
-#       inputs:
-#       - name: template
-#       - name: terraform-state
-#       outputs:
-#       - name: tfstate-output
-#       run:
-#         path: sh
-#         args: 
-#         - -c
-#         - |
-#           set -e
-#           cat <<EOF > terraform.tfvars
-#           ${TFVARS}
-#           EOF
-#           terraform init \
-#                     template
-#           terraform plan \
-#                     -var-file terraform.tfvars \
-#                     -out terraform.tfplan \
-#                     -state terraform-state/smb-volume-service.tfstate \
-#                     template
-#           terraform apply \
-#                     -state-out tfstate-output/smb-volume-service.tfstate \
-#                     terraform.tfplan
+          cat <<EOF > terraform.tfvars
+          ${TFVARS}
+          EOF
+          terraform init \
+                    template/terraform
+          terraform plan \
+                    -var-file terraform.tfvars \
+                    -out terraform.tfplan \
+                    -state terraform-state/terraform.tfstate \
+                    template/terraform
+          terraform apply \
+                    -state-out tfstate-output/terraform.tfstate \
+                    terraform.tfplan
 
 - name: upload-product
   build_logs_to_retain: 5
@@ -129,6 +100,9 @@ jobs:
   plan:
   - aggregate:
     - get: terraform-state
+      passed:
+      - pave-azure
+      trigger: true
     - get: pcf-pipelines
     - get: pivnet-product
       params:
@@ -157,6 +131,7 @@ jobs:
 
 - name: configure-product
   build_logs_to_retain: 5
+  serial: true
   plan:
   - aggregate:
     - get: terraform-state
@@ -170,7 +145,6 @@ jobs:
       OPS_MGR_PWD: ((ops_mgr_pwd))
       PRODUCT_NAME: smb-volume-service
       SERVICE_NAMEWORK_NAME: ((service-network-name))
-      SINGLETON_AVAILABILITY_ZONE: ((singleton_availability_zone))
     config:
       platform: linux
       image_resource:
@@ -187,17 +161,55 @@ jobs:
         - |
           set -e
           cp /usr/local/bin/om-linux /usr/local/bin/om
-          cp terraform-state/smb-volume-service.tfstate ./
-        
+          cp terraform-state/terraform.tfstate ./
+
+          SUBSCRIPTION_ID=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.subscription_id.value')
+          TENANT_ID=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.tenant_id.value')
+          CLIENT_ID=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.client_id.value')
+          CLIENT_SECRET=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.client_secret.value')
+          RESOURCE_GROUP_NAME=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.resource_group_name.value') 
+          LOCATION=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.location.value')           
+          DB_HOST=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.sql_server_hostname.value')
+          DB_PORT=1434
+          DB_NAME=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.sql_server_database.value')
+          DB_USERNAME=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.sql_server_administrator.value')
+          DB_PASSWORD=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].outputs.sql_server_administrator_password.value')
+
           cat <<EOF > config.yml
           ---
-          # product-properties:
-          #   .properties.smtp_credentials:
-          #     value:
-          #       identity: $SMTP_USERNAME
-          #       password: $SMTP_PASSWORD
-          #   .properties.smtp_enable_starttls_auto:
-          #     value: $SMTP_ENABLE_STARTTLS
+          product-properties:
+            .properties.environment_selector:
+              value: Azure File Share
+            .properties.environment_selector.azure_option.environment:
+              value: AzureCloud
+            .properties.environment_selector.azure_option.tenantid:
+              value: $TENANT_ID
+            .properties.environment_selector.azure_option.clientid:
+              value: $CLIENT_ID
+            .properties.environment_selector.azure_option.defaultsubscriptionid:
+              value: $SUBSCRIPTION_ID
+            .properties.environment_selector.azure_option.clientsecret:
+              value: 
+                secret: $CLIENT_SECRET
+            .properties.environment_selector.azure_option.defaultresourcegroupname:
+              value: $RESOURCE_GROUP_NAME
+            .properties.environment_selector.azure_option.defaultlocation:
+              value: $LOCATION
+            .properties.dbdrivername:
+              value: mssql
+            .properties.database_selector:
+              value: Existing External Database
+            .properties.database_selector.database_option.dbhost:
+              value: $DB_HOST
+            .properties.database_selector.database_option.dbport:
+              value: $DB_PORT
+            .properties.database_selector.database_option.dbname:
+              value: $DB_NAME
+            .properties.database_selector.database_option.dbusername:
+              value: $DB_USERNAME
+            .properties.database_selector.database_option.dbpassword:
+              value: 
+                secret: "$DB_PASSWORD"
           network-properties:
             network:
               name: $SERVICE_NAMEWORK_NAME
@@ -230,4 +242,21 @@ jobs:
              --errand-name="${e}" \
              --post-deploy-state=when-changed
           done
-
+- name: deploy-product
+  build_logs_to_retain: 5
+  serial: true
+  plan:
+  - aggregate:
+    - get: pcf-pipelines
+    - get: terraform-state
+      passed:
+      - configure-product
+      trigger: true
+  - task: deploy-product
+    file: pcf-pipelines/tasks/apply-changes/task.yml
+    params:
+      OPSMAN_DOMAIN_OR_IP_ADDRESS: ((opsman_domain_or_ip_address))
+      OPSMAN_USERNAME: ((ops_mgr_usr))
+      OPSMAN_PASSWORD: ((ops_mgr_pwd))
+      OPSMAN_CLIENT_ID: ""
+      OPSMAN_CLIENT_SECRET: ""
