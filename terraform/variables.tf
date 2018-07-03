@@ -1,5 +1,7 @@
 variable "env_name" {}
 
+variable "env_short_name" {}
+
 variable "subscription_id" {}
 
 variable "tenant_id" {}

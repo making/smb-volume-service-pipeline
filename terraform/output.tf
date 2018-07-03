@@ -42,3 +42,7 @@ output "sql_server_hostname" {
 output "sql_server_database" {
   value     = "${azurerm_sql_database.smb_volume_service.name}"
 }
+
+output "smb_volume_storage_account" {
+  value     = "${azurerm_storage_account.smb_volume_service.name}"
+}
