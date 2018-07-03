@@ -20,7 +20,6 @@ resource "azurerm_sql_database" "smb_volume_service" {
   edition                      = "${var.sql_server_edition}"
 }
 
-
 resource "azurerm_sql_firewall_rule" "smb_volume_service" {
   name                         = "smb_volume_service"
   resource_group_name          = "${azurerm_resource_group.pcf_services_resource_group.name}"
