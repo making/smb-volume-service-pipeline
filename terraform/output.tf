@@ -18,6 +18,14 @@ output "client_secret" {
   value     = "${var.client_secret}"
 }
 
+output "location" {
+  value     = "${var.location}"
+}
+
+output "resource_group_name" {
+  value     = "${azurerm_resource_group.pcf_services_resource_group.name}"
+}
+
 output "sql_server_administrator" {
   value     = "${var.sql_server_administrator}"
 }
