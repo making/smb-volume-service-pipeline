@@ -1,0 +1,233 @@
+---
+resource_types:
+- name: azure-blobstore
+  type: docker-image
+  source:
+    repository: czero/azure-blobstore-resource
+- name: pivnet
+  type: docker-image
+  source:
+    repository: pivotalcf/pivnet-resource
+    tag: latest-final
+
+resources:
+- name: pcf-pipelines
+  type: git
+  source:
+    uri: https://github.com/pivotal-cf/pcf-pipelines.git
+    tag_filter: v0.23.5
+- name: terraform-state
+  type: azure-blobstore
+  source:
+    storage_account_name: ((terraform_azure_storage_account_name))
+    storage_account_key: ((terraform_azure_storage_access_key))
+    container: ((azure_storage_container_name))
+    versioned_file: smb-volume-service.tfstate
+- name: pivnet-product
+  type: pivnet
+  source:
+    api_token: ((pivnet_api_token))
+    product_slug: smb-volume-service
+
+jobs:
+- name: bootstrap-terraform-state
+  build_logs_to_retain: 5
+  serial: true
+  plan:
+  - task: create-terraform-state
+    params:
+      AZURE_STORAGE_ACCOUNT: ((terraform_azure_storage_account_name))
+      AZURE_STORAGE_KEY: ((terraform_azure_storage_access_key))
+      CONTAINER: ((azure_storage_container_name))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pcfnorm/rootfs
+          tag: 1.0.14
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          # https://github.com/pivotal-cf/pcf-pipelines/blob/v0.23.4/install-pcf/azure/tasks/create-initial-terraform-state/task.sh
+          blobs=$(az storage blob list -c ${CONTAINER})
+          files=$(echo "$blobs" | jq -r .[].name)
+
+          set +e
+          echo ${files} | grep smb-volume-service.tfstate
+          if [ "$?" -gt "0" ]; then
+            echo "{\"version\": 3}" > smb-volume-service.tfstate
+            az storage blob upload -c ${CONTAINER} -n smb-volume-service.tfstate -f smb-volume-service.tfstate
+            set +x
+            if [ "$?" -gt "0" ]; then
+              echo "Failed to upload empty tfstate file"
+              exit 1
+            fi
+            set -x
+            az storage blob snapshot -c ${CONTAINER} -n smb-volume-service.tfstate
+            set +x
+            if [ "$?" -gt "0" ]; then
+              echo "Failed to create snapshot of tfstate file"
+              exit 1
+            fi
+          else
+            echo "smb-volume-service.tfstate file found, skipping"
+            exit 0
+          fi
+
+# - name: pave-azure
+#   build_logs_to_retain: 5
+#   serial_groups: [terraform]
+#   ensure:
+#     put: terraform-state
+#     params:
+#       file: tfstate-output/smb-volume-service.tfstate
+#   plan:
+#   - aggregate:
+#     - get: template
+#     - get: terraform-state
+#   - task: terraform-apply
+#     params:
+#       TFVARS: ((tfvars))
+#     config:
+#       platform: linux
+#       image_resource:
+#         type: docker-image
+#         source:
+#           repository: hashicorp/terraform
+#           tag: light
+#       inputs:
+#       - name: template
+#       - name: terraform-state
+#       outputs:
+#       - name: tfstate-output
+#       run:
+#         path: sh
+#         args: 
+#         - -c
+#         - |
+#           set -e
+#           cat <<EOF > terraform.tfvars
+#           ${TFVARS}
+#           EOF
+#           terraform init \
+#                     template
+#           terraform plan \
+#                     -var-file terraform.tfvars \
+#                     -out terraform.tfplan \
+#                     -state terraform-state/smb-volume-service.tfstate \
+#                     template
+#           terraform apply \
+#                     -state-out tfstate-output/smb-volume-service.tfstate \
+#                     terraform.tfplan
+
+- name: upload-product
+  build_logs_to_retain: 5
+  serial: true
+  plan:
+  - aggregate:
+    - get: terraform-state
+    - get: pcf-pipelines
+    - get: pivnet-product
+      params:
+        globs:
+        - "*.pivotal"
+  - task: upload-tile
+    file: pcf-pipelines/tasks/upload-product-and-stemcell/task.yml
+    params:
+      OPSMAN_DOMAIN_OR_IP_ADDRESS: ((opsman_domain_or_ip_address))
+      OPSMAN_CLIENT_ID: ""
+      OPSMAN_CLIENT_SECRET: ""
+      OPS_MGR_USR: ((ops_mgr_usr))
+      OPS_MGR_PWD: ((ops_mgr_pwd))
+      PIVNET_API_TOKEN: ((pivnet_api_token))
+      NO_PROXY: ""
+      OM_IP: ""
+      IAAS: ((iaas))
+  - task: stage-tile
+    file: pcf-pipelines/tasks/stage-product/task.yml
+    params:
+      OPSMAN_DOMAIN_OR_IP_ADDRESS: ((opsman_domain_or_ip_address))
+      OPSMAN_CLIENT_ID: ""
+      OPSMAN_CLIENT_SECRET: ""
+      OPSMAN_USERNAME: ((ops_mgr_usr))
+      OPSMAN_PASSWORD: ((ops_mgr_pwd))
+
+- name: configure-product
+  build_logs_to_retain: 5
+  plan:
+  - aggregate:
+    - get: terraform-state
+      passed:
+      - upload-product
+      trigger: true
+  - task: configure-product
+    params:
+      OPSMAN_DOMAIN_OR_IP_ADDRESS: ((opsman_domain_or_ip_address))
+      OPS_MGR_USR: ((ops_mgr_usr))
+      OPS_MGR_PWD: ((ops_mgr_pwd))
+      PRODUCT_NAME: smb-volume-service
+      SERVICE_NAMEWORK_NAME: ((service-network-name))
+      SINGLETON_AVAILABILITY_ZONE: ((singleton_availability_zone))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pcfnorm/rootfs
+          tag: 1.0.14
+      inputs:
+      - name: terraform-state
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          set -e
+          cp /usr/local/bin/om-linux /usr/local/bin/om
+          cp terraform-state/smb-volume-service.tfstate ./
+        
+          cat <<EOF > config.yml
+          ---
+          # product-properties:
+          #   .properties.smtp_credentials:
+          #     value:
+          #       identity: $SMTP_USERNAME
+          #       password: $SMTP_PASSWORD
+          #   .properties.smtp_enable_starttls_auto:
+          #     value: $SMTP_ENABLE_STARTTLS
+          network-properties:
+            network:
+              name: $SERVICE_NAMEWORK_NAME
+            other_availability_zones:
+            - name: "null"
+            singleton_availability_zone:
+              name: "null"
+          EOF
+
+          cat config.yml
+
+          om --target "https://${OPSMAN_DOMAIN_OR_IP_ADDRESS}" \
+             --username "$OPS_MGR_USR" \
+             --password "$OPS_MGR_PWD" \
+             --skip-ssl-validation \
+             configure-product \
+             --product-name "${PRODUCT_NAME}" \
+             --config config.yml
+
+          # Errands
+          for e in \
+            deploy-all \
+            ;do
+            om --target "https://${OPSMAN_DOMAIN_OR_IP_ADDRESS}" \
+             --username "$OPS_MGR_USR" \
+             --password "$OPS_MGR_PWD" \
+             --skip-ssl-validation \
+             set-errand-state \
+             --product-name "${PRODUCT_NAME}" \
+             --errand-name="${e}" \
+             --post-deploy-state=when-changed
+          done
+
